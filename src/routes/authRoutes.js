@@ -2,48 +2,51 @@ import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { resHelper } from "../helpers/errorHandler.js";
-import { pool } from "../db.js";
+import prisma from "../prismaClient.js";
 
 const router = express.Router();
 
 router.post(`/register`, async (req, res, next) => {
   const { username, password } = req.body;
-  const client = await pool.connect();
+  const defaultTodo = `Hello! Start adding todos!`;
 
   try {
-    await client.query(`BEGIN`);
+    const result = await prisma.$transaction(async (tx) => {
+      const existingUser = await tx.user.findUnique({
+        where: { username },
+      });
 
-    const userExists = await client.query(
-      "SELECT * FROM users WHERE username = $1",
-      [username]
-    );
+      if (existingUser) {
+        throw new Error("Username already exists");
+      }
 
-    if (userExists.rows[0]) {
-      await client.query(`ROLLBACK`);
-      return resHelper(res, 400, "Username already exists");
-    }
+      const newUser = await tx.user.create({
+        data: {
+          username,
+          password: await bcrypt.hash(password, 10),
+          todos: {
+            create: {
+              task: defaultTodo,
+            },
+          },
+        },
+        include: {
+          todos: true,
+        },
+      });
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const defaultTodo = `Hello! Start adding todos!`;
+      return newUser;
+    });
 
-    const newUser = await client.query(
-      "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id",
-      [username, hashedPassword]
-    );
-    const userId = newUser.rows[0].id;
-
-    await client.query("INSERT INTO todos (user_id, task) VALUES ($1, $2)", [
-      userId,
-      defaultTodo,
-    ]);
-
-    await client.query(`COMMIT`);
-    resHelper(res, 201, "User registered");
+    resHelper(res, 201, "User registered", {
+      userId: result.id,
+      todoCount: result.todos.length,
+    });
   } catch (err) {
-    await client.query(`ROLLBACK`);
+    if (err.message === "Username already exists") {
+      return resHelper(res, 400, err.message);
+    }
     next(err);
-  } finally {
-    client.release();
   }
 });
 
@@ -51,26 +54,22 @@ router.post(`/login`, async (req, res, next) => {
   const { username, password } = req.body;
 
   try {
-    const user = await pool.query("SELECT * FROM users WHERE username = $1", [
-      username,
-    ]);
-    if (!user.rows[0]) {
+    const user = await prisma.user.findUnique({
+      where: { username },
+    });
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
       return resHelper(res, 400, "Invalid credentials");
     }
 
-    const isValidPassword = await bcrypt.compare(
-      password,
-      user.rows[0].password
-    );
-    if (!isValidPassword) {
-      return resHelper(res, 400, "Invalid credentials");
-    }
-
-    const token = jwt.sign({ id: user.rows[0].id }, process.env.JWT_SECRET, {
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, {
       expiresIn: "24h",
     });
 
-    resHelper(res, 200, "Login successful", { token });
+    resHelper(res, 200, "Login successful", {
+      token,
+      username: user.username,
+    });
   } catch (err) {
     next(err);
   }
